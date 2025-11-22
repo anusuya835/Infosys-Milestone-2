@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Hand Gesture Volume Control — Show W/H/Distance</title>
+  <style>
+    body {
+      background: linear-gradient(to right, #6a11cb, #2575fc);
+      font-family: "Poppins", sans-serif;
+      color: white;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 18px;
+      margin: 0;
+      min-height: 100vh;
+      box-sizing: border-box;
+    }
+    h1 { margin: 8px 0 16px; text-shadow: 2px 2px 5px rgba(0,0,0,0.3); }
+    .frame {
+      position: relative;
+      width: 640px;
+      max-width: 95vw;
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      border: 4px solid rgba(255,255,255,0.12);
+      background: #000;
+    }
+    video {
+      display: block;
+      width: 100%;
+      height: auto;
+      object-fit: cover;
+    }
+    canvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    .controls {
+      margin-top: 14px;
+      width: 640px;
+      max-width: 95vw;
+      display:flex;
+      gap:10px;
+      align-items:center;
+      justify-content:space-between;
+    }
+    .left {
+      display:flex;
+      gap:8px;
+      align-items:center;
+    }
+    button {
+      padding: 10px 16px;
+      border-radius: 10px;
+      border: none;
+      background: white;
+      color: #2575fc;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.ghost {
+      background: rgba(255,255,255,0.12);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .panel {
+      display:flex;
+      gap:10px;
+      align-items:center;
+      color:#f0f7ff;
+      font-size:14px;
+    }
+    label { font-size:13px; color: #e8f6ff; margin-right:6px; }
+    input[type=number] {
+      width:80px;
+      padding:6px 8px;
+      border-radius:8px;
+      border:1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.03);
+      color: white;
+    }
+    .stats {
+      margin-top:10px;
+      color:#e8f6ff;
+      font-size:15px;
+    }
+    .foot { margin-top:12px; font-size:13px; color:rgba(255,255,255,0.9) }
+    @media (max-width:700px){ .controls, .panel {flex-direction:column;align-items:stretch} .left{flex-wrap:wrap} }
+  </style>
+
+  <!-- MediaPipe -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+  <h1>🎵 Hand Volume — Show Width / Height / Distance</h1>
+
+  <div class="frame">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="controls">
+    <div class="left">
+      <button id="startBtn">Open Webcam</button>
+      <button id="stopBtn" class="ghost" disabled>Stop</button>
+    </div>
+
+    <div class="panel">
+      <label>Hand width (cm):</label>
+      <input id="handWidth" type="number" value="8.0" step="0.1" />
+      <label>Calib dist (cm):</label>
+      <input id="calibDist" type="number" value="50" step="1" />
+      <button id="calibrateBtn" class="ghost">Calibrate</button>
+      <label style="margin-left:8px">F: <span id="Fval">—</span></label>
+    </div>
+  </div>
+
+  <div class="stats" id="stats">Width: — px • Height: — px • Distance: — cm</div>
+  <div class="foot">Tip: place your hand roughly facing the camera, press Calibrate at a measured distance (e.g., 50 cm).</div>
+
+<script>
+(async function(){
+  // Elements
+  const video = document.getElementById('webcam');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const handWidthInput = document.getElementById('handWidth');
+  const calibDistInput = document.getElementById('calibDist');
+  const calibrateBtn = document.getElementById('calibrateBtn');
+  const FvalEl = document.getElementById('Fval');
+  const statsEl = document.getElementById('stats');
+
+  let cameraHelper = null;
+  let lastKnucklePx = null;
+  let focalF = null;
+  let lastTime = performance.now();
+  let smoothedDistance = null;
+
+  function resizeCanvas(){
+    canvas.width = video.videoWidth || canvas.clientWidth;
+    canvas.height = video.videoHeight || canvas.clientHeight;
+  }
+
+  function smooth(prev, now, alpha=0.25){
+    if (prev === null) return now;
+    return prev*(1-alpha) + now*alpha;
+  }
+
+  // compute bbox (px) from normalized landmarks
+  function landmarksBBoxPx(landmarks){
+    let minX = 1, minY = 1, maxX = 0, maxY = 0;
+    for (const lm of landmarks){
+      minX = Math.min(minX, lm.x);
+      minY = Math.min(minY, lm.y);
+      maxX = Math.max(maxX, lm.x);
+      maxY = Math.max(maxY, lm.y);
+    }
+    const w = (maxX - minX) * canvas.width;
+    const h = (maxY - minY) * canvas.height;
+    return {w, h, minX: minX*canvas.width, minY: minY*canvas.height, maxX: maxX*canvas.width, maxY: maxY*canvas.height};
+  }
+
+  // knuckle width pixel (index MCP 5 to pinky MCP 17)
+  function knuckleWidthPx(lm){
+    const a = {x: lm[5].x * canvas.width, y: lm[5].y * canvas.height};
+    const b = {x: lm[17].x * canvas.width, y: lm[17].y * canvas.height};
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+
+  // Setup MediaPipe Hands
+  const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+
+  hands.onResults(onResults);
+
+  // Camera helper
+  const cam = new Camera(video, {
+    onFrame: async () => { await hands.send({image: video}); },
+    width: 1280, height: 720
+  });
+
+  startBtn.onclick = async () => {
+    try {
+      await cam.start();
+      cameraHelper = cam;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    } catch (err) {
+      alert('Camera error: ' + err.message);
+      console.error(err);
+    }
+  };
+
+  stopBtn.onclick = () => {
+    try {
+      if (cameraHelper) cameraHelper.stop();
+    } catch(e){}
+    cameraHelper = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+  };
+
+  calibrateBtn.onclick = () => {
+    const W_real = parseFloat(handWidthInput.value);
+    const D_cal = parseFloat(calibDistInput.value);
+    if (!lastKnucklePx) return alert('Make sure your hand is visible (detected) before calibrating.');
+    if (!W_real || !D_cal) return alert('Enter valid numbers for hand width & calibration distance.');
+    focalF = lastKnucklePx * D_cal / W_real;
+    FvalEl.textContent = focalF.toFixed(2);
+    alert('Calibrated F = ' + focalF.toFixed(2));
+  };
+
+  function onResults(results){
+    resizeCanvas();
+    const now = performance.now();
+    const dt = now - lastTime;
+    lastTime = now;
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+      statsEl.textContent = 'Width: — px • Height: — px • Distance: — cm';
+      return;
+    }
+
+    const lm = results.multiHandLandmarks[0];
+
+    // draw landmarks + connections
+    drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: '#00ffbb', lineWidth:2});
+    drawLandmarks(ctx, lm, {color: '#00ffbb', lineWidth:1});
+
+    // compute bbox and knuckle px
+    const bbox = landmarksBBoxPx(lm);
+    const pxW = bbox.w;
+    const pxH = bbox.h;
+    const knucklePx = knuckleWidthPx(lm);
+    lastKnucklePx = knucklePx;
+
+    // estimate distance if calibrated
+    let distText = 'Calibrate';
+    if (focalF) {
+      const W_real = parseFloat(handWidthInput.value) || 8;
+      const est = (W_real * focalF) / knucklePx;
+      smoothedDistance = smooth(smoothedDistance, est, parseFloat(document.getElementById('handWidth').value ? 0.25 : 0.25));
+      distText = (smoothedDistance ? smoothedDistance.toFixed(1) : est.toFixed(1));
+    }
+
+    // draw bounding box and overlay text
+    ctx.strokeStyle = 'rgba(0,230,150,0.9)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(bbox.minX, bbox.minY, bbox.w, bbox.h);
+
+    // text background
+    const tx = Math.max(6, bbox.minX);
+    const ty = Math.max(6, bbox.minY - 56);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(tx, ty, 220, 54);
+
+    ctx.fillStyle = '#e6fff8';
+    ctx.font = '14px system-ui, Arial';
+    ctx.fillText(`W: ${Math.round(pxW)} px`, tx + 8, ty + 18);
+    ctx.fillText(`H: ${Math.round(pxH)} px`, tx + 8, ty + 36);
+    ctx.fillText(`D: ${distText} cm`, tx + 120, ty + 36);
+
+    // update stats below
+    statsEl.textContent = `Width: ${Math.round(pxW)} px • Height: ${Math.round(pxH)} px • Distance: ${distText} cm`;
+  }
+
+  // Pre-check permission so Start button is active quickly
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({video:true});
+    s.getTracks().forEach(t=>t.stop());
+    startBtn.disabled = false;
+  } catch (e) {
+    // still allow manual start which will prompt permission
+    startBtn.disabled = false;
+  }
+})();
+</script>
+</body>
+</html>
